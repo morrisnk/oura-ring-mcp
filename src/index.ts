@@ -26,6 +26,7 @@ import { registerResources } from "./resources/index.js";
 import { registerPrompts } from "./prompts/index.js";
 import { loadCredentials, isExpired } from "./auth/store.js";
 import { refreshAccessToken, getOAuthConfigFromEnv } from "./auth/oauth.js";
+import { TokenManager } from "./auth/token-manager.js";
 
 // Read version from package.json
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -143,6 +144,40 @@ const server = new McpServer({
 });
 
 const ouraClient = new OuraClient({ accessToken: accessToken ?? "" });
+
+// In MCP_AUTH_MODE=static we manage the Oura OAuth token ourselves so
+// Hermes / Claude Desktop clients can authenticate via MCP_SECRET while
+// the server keeps a long-running OAuth session alive with Oura.
+const useStaticBearerMode =
+  (process.env.MCP_AUTH_MODE ?? "").toLowerCase() === "static";
+
+if (useHttpTransport && useStaticBearerMode) {
+  const oauthConfig = getOAuthConfigFromEnv();
+  if (!oauthConfig) {
+    console.error(
+      "MCP_AUTH_MODE=static requires OURA_CLIENT_ID and OURA_CLIENT_SECRET."
+    );
+    process.exit(1);
+  }
+
+  const tokenManager = new TokenManager({
+    oauthConfig,
+    seedRefreshToken: process.env.OURA_REFRESH_TOKEN,
+    onTokenUpdate: (token) => ouraClient.setAccessToken(token),
+  });
+
+  try {
+    await tokenManager.initialize();
+    console.error("Oura OAuth token manager initialized");
+  } catch (err) {
+    console.error(
+      `Failed to initialize Oura token manager: ${err instanceof Error ? err.message : err}`
+    );
+    process.exit(1);
+  }
+
+  ouraClient.setOnUnauthorized(() => tokenManager.refresh());
+}
 
 // Register all tools, resources, and prompts with the server
 registerTools(server, ouraClient);

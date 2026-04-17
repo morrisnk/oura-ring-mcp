@@ -39,6 +39,12 @@ export type SleepTime = components["schemas"]["SleepTimeModel"];
 
 export interface OuraClientConfig {
   accessToken: string;
+  /**
+   * Optional hook invoked when the Oura API returns 401.
+   * Should refresh the token and return the new access token.
+   * The client will retry the request exactly once with the new token.
+   */
+  onUnauthorized?: () => Promise<string>;
 }
 
 // Generic response wrapper from Oura API
@@ -49,9 +55,11 @@ export interface OuraResponse<T> {
 
 export class OuraClient {
   private accessToken: string;
+  private onUnauthorized?: () => Promise<string>;
 
   constructor(config: OuraClientConfig) {
     this.accessToken = config.accessToken;
+    this.onUnauthorized = config.onUnauthorized;
   }
 
   /**
@@ -61,23 +69,40 @@ export class OuraClient {
     this.accessToken = token;
   }
 
-  private async fetch<T>(
-    endpoint: string,
-    params?: Record<string, string>
-  ): Promise<T> {
-    const url = new URL(`${BASE_URL}/${endpoint}`);
+  /**
+   * Install or replace the unauthorized hook used to refresh tokens on 401.
+   */
+  setOnUnauthorized(handler: (() => Promise<string>) | undefined): void {
+    this.onUnauthorized = handler;
+  }
 
+  private buildUrl(endpoint: string, params?: Record<string, string>): string {
+    const url = new URL(`${BASE_URL}/${endpoint}`);
     if (params) {
       Object.entries(params).forEach(([key, value]) => {
         url.searchParams.append(key, value);
       });
     }
+    return url.toString();
+  }
 
-    const response = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${this.accessToken}`,
-      },
+  private async fetch<T>(
+    endpoint: string,
+    params?: Record<string, string>
+  ): Promise<T> {
+    const url = this.buildUrl(endpoint, params);
+
+    let response = await fetch(url, {
+      headers: { Authorization: `Bearer ${this.accessToken}` },
     });
+
+    if (response.status === 401 && this.onUnauthorized) {
+      const newToken = await this.onUnauthorized();
+      this.accessToken = newToken;
+      response = await fetch(url, {
+        headers: { Authorization: `Bearer ${this.accessToken}` },
+      });
+    }
 
     if (!response.ok) {
       const body = await response.text();

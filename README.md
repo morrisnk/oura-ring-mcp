@@ -213,8 +213,22 @@ In the Railway dashboard, add:
 | `NODE_ENV` | `production` |
 | `MCP_SECRET` | *(Optional)* Static bearer token for Claude Desktop (`openssl rand -base64 32`) |
 | `OURA_ACCESS_TOKEN` | *(Optional)* PAT fallback if not using OAuth (`MCP_SECRET` required) |
+| `MCP_AUTH_MODE` | *(Optional)* Set to `static` for bearer-only auth with server-managed Oura OAuth (see below) |
+| `OURA_REFRESH_TOKEN` | *(Required on first run in `static` mode)* Seed refresh token from `npx oura-ring-mcp auth` |
+| `OURA_CREDENTIALS_PATH` | *(Recommended in `static` mode)* File path for persisted Oura credentials — mount a persistent volume at this path |
 
 Railway automatically sets `PORT` and `RAILWAY_PUBLIC_DOMAIN`.
+
+#### Static bearer + server-managed Oura OAuth (`MCP_AUTH_MODE=static`)
+
+Use this for agents (e.g. Hermes) that authenticate with a static bearer token but where you still want Oura OAuth token refresh instead of a long-lived PAT. Works on any Docker host (Railway, unraid, self-hosted, etc.).
+
+- MCP clients authenticate with `Authorization: Bearer $MCP_SECRET`. The public MCP OAuth 2.1 endpoints (`/authorize`, `/token`, `/register`) are **not** mounted.
+- The server holds a long-running Oura OAuth session, refreshing in the background and persisting the rotated refresh token to `OURA_CREDENTIALS_PATH`.
+- Required env: `MCP_SECRET`, `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET`, and either `OURA_REFRESH_TOKEN` (first run) or pre-seeded credentials at `OURA_CREDENTIALS_PATH`.
+- Mount a persistent volume so the rotating refresh token survives restarts. Examples:
+  - Docker (unraid/self-hosted): `-v /mnt/user/appdata/oura-mcp:/data` with `OURA_CREDENTIALS_PATH=/data/credentials.json`
+  - Railway: attach a volume at `/data`, set `OURA_CREDENTIALS_PATH=/data/credentials.json`
 
 ### 4. Connect from Claude.ai
 

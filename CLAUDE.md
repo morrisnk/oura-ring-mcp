@@ -513,6 +513,14 @@ npx oura-ring-mcp logout   # Clear stored credentials
 ```
 Credentials saved to `~/.oura-mcp/credentials.json`. Server auto-refreshes expired tokens.
 
+**Option 3b: Static bearer with server-managed Oura OAuth (`MCP_AUTH_MODE=static`)**
+
+For agents that authenticate with a static bearer (Hermes, Claude Desktop, etc.) but where you want Oura OAuth refresh instead of a PAT. Public MCP OAuth endpoints are NOT mounted.
+
+- Required env: `MCP_SECRET`, `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET`, `OURA_REFRESH_TOKEN` (seed, first run only), `OURA_CREDENTIALS_PATH` (recommended, Railway volume mount).
+- `TokenManager` (`src/auth/token-manager.ts`) loads persisted credentials, refreshes ~5 min before expiry, and writes the rotated refresh token back to disk.
+- `OuraClient.onUnauthorized` retries once on 401 by asking the token manager to refresh.
+
 **Option 3: Remote via Claude.ai connector (Phase 4b - implemented)**
 
 The HTTP transport proxies OAuth through Oura — users authenticate directly with Oura:
