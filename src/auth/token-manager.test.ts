@@ -165,6 +165,36 @@ describe("TokenManager", () => {
     mgr.stop();
   });
 
+  it("caps setTimeout delay to avoid 32-bit overflow on 30-day tokens", async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+
+    vi.mocked(store.loadCredentials).mockResolvedValue({
+      access_token: "a",
+      refresh_token: "r",
+      token_type: "Bearer",
+      // Oura issues ~30-day access tokens; raw delay would overflow setTimeout.
+      expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000,
+    });
+
+    const mgr = new TokenManager({
+      oauthConfig: CONFIG,
+      onTokenUpdate,
+    });
+    await mgr.initialize();
+
+    const MAX_TIMEOUT_MS = 2_147_483_647;
+    const delays = setTimeoutSpy.mock.calls.map((c) => c[1] as number);
+    const schedulingCalls = delays.filter((d) => d > 1000);
+    expect(schedulingCalls.length).toBeGreaterThan(0);
+    for (const d of schedulingCalls) {
+      expect(d).toBeLessThanOrEqual(MAX_TIMEOUT_MS);
+    }
+
+    mgr.stop();
+    setTimeoutSpy.mockRestore();
+  });
+
   it("rotates refresh token on refresh", async () => {
     vi.mocked(store.loadCredentials).mockResolvedValue(null);
     mockFetch
