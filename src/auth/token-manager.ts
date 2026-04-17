@@ -103,12 +103,22 @@ export class TokenManager {
     const bufferMs = this.options.refreshBufferMs ?? 5 * 60 * 1000;
     const msUntilExpiry = this.credentials.expires_at - Date.now();
     const refreshIn = Math.max(60_000, msUntilExpiry - bufferMs);
+    // Node setTimeout uses a 32-bit signed int for the delay (~24.8 days).
+    // Oura access tokens live 30 days, so we must cap and reschedule.
+    const MAX_TIMEOUT_MS = 2_147_483_647;
+    const delay = Math.min(refreshIn, MAX_TIMEOUT_MS);
+    const isCapped = refreshIn > MAX_TIMEOUT_MS;
 
     this.refreshTimer = setTimeout(() => {
+      if (isCapped) {
+        // Not time to refresh yet — just reschedule with the remaining window.
+        this.scheduleRefresh();
+        return;
+      }
       void this.refresh().catch((err) => {
         console.error("Background token refresh failed:", err);
       });
-    }, refreshIn);
+    }, delay);
     this.refreshTimer.unref?.();
   }
 }
