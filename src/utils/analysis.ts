@@ -710,7 +710,7 @@ export function dayOfWeekAnalysis(
   };
 
   for (const { date, value } of data) {
-    const dayIndex = new Date(date).getDay();
+    const dayIndex = new Date(date).getUTCDay();
     const dayName = DAY_NAMES[dayIndex];
     dayTotals[dayName].push(value);
   }

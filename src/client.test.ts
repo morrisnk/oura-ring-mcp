@@ -54,6 +54,27 @@ describe("OuraClient", () => {
     });
   });
 
+  describe("setAccessToken", () => {
+    it("uses the updated token on subsequent requests", async () => {
+      const newClient = new OuraClient({ accessToken: "old-token" });
+      newClient.setAccessToken("new-token");
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve(sleepResponse),
+      });
+
+      await newClient.getSleep("2024-01-15", "2024-01-15");
+
+      expect(mockFetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          headers: { Authorization: "Bearer new-token" },
+        })
+      );
+    });
+  });
+
   // ─────────────────────────────────────────────────────────────
   // Fetch behavior tests
   // ─────────────────────────────────────────────────────────────
