@@ -75,6 +75,86 @@ describe("OuraClient", () => {
     });
   });
 
+  describe("onUnauthorized hook", () => {
+    it("refreshes and retries once on 401", async () => {
+      const onUnauthorized = vi.fn().mockResolvedValue("refreshed-token");
+      const hookedClient = new OuraClient({
+        accessToken: "stale-token",
+        onUnauthorized,
+      });
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          text: () => Promise.resolve("Unauthorized"),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(sleepResponse),
+        });
+
+      const result = await hookedClient.getSleep("2024-01-15", "2024-01-15");
+
+      expect(result.data).toHaveLength(1);
+      expect(onUnauthorized).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch.mock.calls[1][1]).toMatchObject({
+        headers: { Authorization: "Bearer refreshed-token" },
+      });
+    });
+
+    it("does not retry more than once", async () => {
+      const onUnauthorized = vi.fn().mockResolvedValue("still-bad");
+      const hookedClient = new OuraClient({
+        accessToken: "stale",
+        onUnauthorized,
+      });
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          text: () => Promise.resolve("Unauthorized"),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          text: () => Promise.resolve("Unauthorized"),
+        });
+
+      await expect(
+        hookedClient.getSleep("2024-01-15", "2024-01-15")
+      ).rejects.toThrow(/Authentication failed/);
+      expect(onUnauthorized).toHaveBeenCalledTimes(1);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it("setOnUnauthorized installs the hook after construction", async () => {
+      const hookedClient = new OuraClient({ accessToken: "stale" });
+      const onUnauthorized = vi.fn().mockResolvedValue("refreshed");
+      hookedClient.setOnUnauthorized(onUnauthorized);
+
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 401,
+          statusText: "Unauthorized",
+          text: () => Promise.resolve("Unauthorized"),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(sleepResponse),
+        });
+
+      await hookedClient.getSleep("2024-01-15", "2024-01-15");
+      expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ─────────────────────────────────────────────────────────────
   // Fetch behavior tests
   // ─────────────────────────────────────────────────────────────

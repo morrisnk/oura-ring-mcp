@@ -78,7 +78,18 @@ export async function startHttpServer(
   const ouraClientSecret = process.env.OURA_CLIENT_SECRET;
   const hasOuraOAuth = !!(ouraClientId && ouraClientSecret);
 
-  if (!hasOuraOAuth && !secret) {
+  // `static` disables the public MCP OAuth 2.1 provider — MCP clients must
+  // present MCP_SECRET as a bearer token. Oura API tokens are managed
+  // server-side (e.g. via TokenManager) and are not exposed to clients.
+  const authMode = (process.env.MCP_AUTH_MODE ?? "").toLowerCase();
+  const useStaticBearerMode = authMode === "static";
+
+  if (useStaticBearerMode && !secret) {
+    console.error(
+      "ERROR: MCP_AUTH_MODE=static requires MCP_SECRET to be set."
+    );
+  }
+  if (!useStaticBearerMode && !hasOuraOAuth && !secret) {
     console.error(
       "WARNING: No authentication configured!\n" +
         "Set OURA_CLIENT_ID + OURA_CLIENT_SECRET for OAuth, or MCP_SECRET for static auth."
@@ -113,9 +124,30 @@ export async function startHttpServer(
     res.json({ status: "ok", service: "oura-mcp" });
   });
 
-  // ── OAuth Setup ──────────────────────────────────────────
+  // ── Auth Setup ───────────────────────────────────────────
 
-  if (!hasOuraOAuth) {
+  if (useStaticBearerMode) {
+    // Static-bearer-only mode. No public OAuth 2.1 endpoints; MCP clients
+    // authenticate with MCP_SECRET. The caller is responsible for keeping
+    // `ouraClient` supplied with a valid Oura token (e.g. via TokenManager).
+    app.use((req, res, next) => {
+      if (req.path === "/health") return next();
+      const authHeader = req.headers.authorization;
+      if (!authHeader) {
+        res.status(401).json({ error: "Missing Authorization header" });
+        return;
+      }
+      const [scheme, token] = authHeader.split(" ");
+      if (scheme !== "Bearer" || !secret || token !== secret) {
+        res.status(401).json({ error: "Invalid credentials" });
+        return;
+      }
+      next();
+    });
+    console.error(
+      "Static bearer token authentication enabled (MCP_AUTH_MODE=static)"
+    );
+  } else if (!hasOuraOAuth) {
     // No Oura OAuth credentials — fall back to static MCP_SECRET only
     console.error(
       "Oura OAuth not configured (missing OURA_CLIENT_ID/OURA_CLIENT_SECRET).\n" +
@@ -284,8 +316,9 @@ export async function startHttpServer(
     }
   }
 
-  // If no OAuth setup, still need the MCP endpoint (with simple auth or none)
-  if (!hasOuraOAuth) {
+  // If we're not mounting the MCP OAuth provider, register MCP endpoints
+  // here. Auth (if any) is handled by app-level middleware above.
+  if (useStaticBearerMode || !hasOuraOAuth) {
     const transports = new Map<string, StreamableHTTPServerTransport>();
 
     const mcpHandler = async (req: Request, res: Response) => {
@@ -354,7 +387,7 @@ export async function startHttpServer(
     console.error(`Public URL: ${baseUrl.href}`);
     console.error(`MCP endpoint: POST ${baseUrl.href} (or ${baseUrl.href}mcp)`);
     console.error(`Health check: GET /health`);
-    if (hasOuraOAuth) {
+    if (hasOuraOAuth && !useStaticBearerMode) {
       console.error(
         `OAuth metadata: GET /.well-known/oauth-authorization-server`
       );
