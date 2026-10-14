@@ -49,6 +49,8 @@ class MockStdioServerTransport {
 class MockOuraClient {
   static instances: MockOuraClient[] = [];
   static lastConfig: unknown;
+  setAccessToken = vi.fn();
+  setOnUnauthorized = vi.fn();
 
   constructor(config: unknown) {
     MockOuraClient.lastConfig = config;
@@ -58,6 +60,19 @@ class MockOuraClient {
   static reset() {
     MockOuraClient.instances = [];
     MockOuraClient.lastConfig = undefined;
+  }
+}
+
+class MockTokenManager {
+  static instances: MockTokenManager[] = [];
+  initialize = vi.fn().mockImplementation(async () => {
+    this.options.onTokenUpdate("managed-token");
+    return "managed-token";
+  });
+  refresh = vi.fn();
+
+  constructor(public options: { onTokenUpdate: (token: string) => void }) {
+    MockTokenManager.instances.push(this);
   }
 }
 
@@ -106,6 +121,14 @@ vi.mock("./auth/oauth.js", () => ({
   refreshAccessToken: mockRefreshAccessToken,
 }));
 
+vi.mock("./auth/token-manager.js", () => ({
+  TokenManager: MockTokenManager,
+}));
+
+vi.mock("./transports/http.js", () => ({
+  startHttpServer: vi.fn(),
+}));
+
 // Mock CLI module (for CLI command tests)
 const mockRunAuthFlow = vi.fn();
 const mockRunLogout = vi.fn();
@@ -119,6 +142,7 @@ vi.mock("./auth/cli.js", () => ({
 
 describe("MCP Server", () => {
   const originalEnv = process.env;
+  const originalArgv = process.argv;
   const originalConsoleError = console.error;
 
   beforeEach(() => {
@@ -129,6 +153,7 @@ describe("MCP Server", () => {
     MockMcpServer.reset();
     MockStdioServerTransport.reset();
     MockOuraClient.reset();
+    MockTokenManager.instances = [];
     mockRegisterTools.mockClear();
     mockRegisterResources.mockClear();
     mockRegisterPrompts.mockClear();
@@ -145,6 +170,8 @@ describe("MCP Server", () => {
 
     // Reset environment - always set a token for these tests
     process.env = { ...originalEnv };
+    delete process.env.MCP_AUTH_MODE;
+    process.argv = [...originalArgv];
 
     // Suppress console.error from server startup
     console.error = vi.fn();
@@ -152,6 +179,7 @@ describe("MCP Server", () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    process.argv = originalArgv;
     console.error = originalConsoleError;
   });
 
@@ -286,6 +314,31 @@ describe("MCP Server", () => {
         expect.objectContaining({ clientId: "test-client" })
       );
       expect(MockOuraClient.lastConfig).toEqual({ accessToken: "refreshed-token" });
+    });
+  });
+
+  describe("static bearer mode", () => {
+    it("lets the token manager resolve credentials without a second startup refresh", async () => {
+      process.argv = [originalArgv[0], originalArgv[1], "--http"];
+      process.env.MCP_AUTH_MODE = "static";
+      delete process.env.OURA_ACCESS_TOKEN;
+      delete process.env.OURA_PERSONAL_ACCESS_TOKEN;
+      mockGetOAuthConfigFromEnv.mockReturnValue({
+        clientId: "test-client",
+        clientSecret: "test-secret",
+        redirectUri: "http://localhost:3000/callback",
+      });
+
+      await import("./index.js");
+
+      expect(mockLoadCredentials).not.toHaveBeenCalled();
+      expect(mockRefreshAccessToken).not.toHaveBeenCalled();
+      expect(MockTokenManager.instances).toHaveLength(1);
+      expect(MockTokenManager.instances[0].initialize).toHaveBeenCalledOnce();
+      expect(MockOuraClient.instances[0].setAccessToken).toHaveBeenCalledWith("managed-token");
+      expect(console.error).not.toHaveBeenCalledWith(
+        expect.stringContaining("No Oura credentials found")
+      );
     });
   });
 });

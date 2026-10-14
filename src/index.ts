@@ -40,6 +40,8 @@ const VERSION: string = pkg.version;
 const args = process.argv.slice(2);
 const command = args[0];
 const useHttpTransport = args.includes("--http") || args.includes("-H");
+const useStaticBearerMode =
+  useHttpTransport && (process.env.MCP_AUTH_MODE ?? "").toLowerCase() === "static";
 
 // Handle CLI subcommands
 if (["auth", "logout", "status"].includes(command)) {
@@ -116,7 +118,9 @@ async function getAccessToken(): Promise<string | null> {
 // Server Setup
 // ─────────────────────────────────────────────────────────────
 
-const accessToken = await getAccessToken();
+// Static bearer mode has its own token manager. Resolving stored credentials
+// here would try to refresh the same single-use token before that manager starts.
+const accessToken = useStaticBearerMode ? null : await getAccessToken();
 
 // For stdio transport, a token is required upfront
 if (!accessToken && !useHttpTransport) {
@@ -131,7 +135,7 @@ if (!accessToken && !useHttpTransport) {
   process.exit(1);
 }
 
-if (!accessToken && useHttpTransport) {
+if (!accessToken && useHttpTransport && !useStaticBearerMode) {
   console.error(
     "Warning: No Oura credentials found. Server will start but API calls will fail.\n" +
       "Set OURA_ACCESS_TOKEN environment variable to enable data access."
@@ -148,10 +152,7 @@ const ouraClient = new OuraClient({ accessToken: accessToken ?? "" });
 // In MCP_AUTH_MODE=static we manage the Oura OAuth token ourselves so
 // Hermes / Claude Desktop clients can authenticate via MCP_SECRET while
 // the server keeps a long-running OAuth session alive with Oura.
-const useStaticBearerMode =
-  (process.env.MCP_AUTH_MODE ?? "").toLowerCase() === "static";
-
-if (useHttpTransport && useStaticBearerMode) {
+if (useStaticBearerMode) {
   const oauthConfig = getOAuthConfigFromEnv();
   if (!oauthConfig) {
     console.error(
@@ -171,7 +172,9 @@ if (useHttpTransport && useStaticBearerMode) {
     console.error("Oura OAuth token manager initialized");
   } catch (err) {
     console.error(
-      `Failed to initialize Oura token manager: ${err instanceof Error ? err.message : err}`
+      `Failed to initialize Oura token manager: ${err instanceof Error ? err.message : err}\n` +
+        "Check OURA_CLIENT_ID/OURA_CLIENT_SECRET and the stored refresh token (OURA_CREDENTIALS_PATH, if set). " +
+        "If that token has already been used or revoked, re-authenticate and persist the new credentials."
     );
     process.exit(1);
   }

@@ -230,6 +230,10 @@ Use this for agents (e.g. Hermes) that authenticate with a static bearer token b
   - Docker (unraid/self-hosted): `-v /mnt/user/appdata/oura-mcp:/data` with `OURA_CREDENTIALS_PATH=/data/credentials.json`
   - Railway: attach a volume at `/data`, set `OURA_CREDENTIALS_PATH=/data/credentials.json`
 
+If startup reports `Token refresh failed: 400`, Oura rejected the refresh request. Check that `OURA_CLIENT_ID` and `OURA_CLIENT_SECRET` belong to the OAuth app that issued the token. Oura refresh tokens are single-use, so an old `OURA_REFRESH_TOKEN` cannot be reused after the server rotates it; the latest credentials must be saved on the persistent volume. Stop other server instances using the same credentials before recovering.
+
+To recover, run this build's `node dist/index.js auth` on a machine with a browser, using that same OAuth app and a registered local callback URL. Set `OURA_CREDENTIALS_PATH` to the **host path** of the mounted credentials file so the CLI writes the new token pair directly to the volume, then restart the container. If you instead supply a new `OURA_REFRESH_TOKEN`, move any stale credentials file aside first: stored credentials take precedence over the seed. `OURA_ACCESS_TOKEN` does not bypass OAuth in `MCP_AUTH_MODE=static`.
+
 ### 4. Connect from Claude.ai
 
 Use the **connector** in Claude.ai:
