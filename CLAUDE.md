@@ -127,7 +127,7 @@ Pre-defined templates that guide Claude through common health analysis tasks:
 ## Notes
 
 - When using cURL, load the token in .env
-- Oura PAT tokens deprecated soon → Phase 4a adds OAuth CLI flow
+- Oura authentication uses OAuth authorization code with PKCE; PAT setup is retired.
 - Data syncs when user opens Oura app - "no data" often means ring hasn't synced
 - Sleep data is attributed to the day you woke up, not when you fell asleep
 - Use Zod for API response validation—define schema once, get types with `z.infer<typeof schema>`
@@ -170,7 +170,7 @@ Pre-defined templates that guide Claude through common health analysis tasks:
 ### Phase 4b: Remote Access ✅
 - [x] HTTP transport with Streamable HTTP (blocker for remote use)
 - [x] Railway deployment config (Dockerfile, railway.json, .dockerignore, README docs)
-- [x] Deploy to Railway (PAT env var for auth)
+- [x] Add Railway deployment support (use OAuth app credentials and a durable credential volume)
 - [x] MCP OAuth 2.1 server provider (enables Claude.ai connector auth)
   - Proxies OAuth through Oura (user authenticates with their Oura account)
   - Dynamic client registration (RFC 7591) + PKCE (S256)
@@ -190,7 +190,16 @@ Pre-defined templates that guide Claude through common health analysis tasks:
 - [ ] Integration with other health data sources (Apple Health, Fitbit, Garmin)
 - [ ] Predictive insights (e.g., illness prediction from temperature trends)
 
-**Current status:** Phase 4b complete. Railway deployed with OAuth 2.1 auth (Oura proxy), Claude.ai connector working. 27 tools, 7 resources, 7 prompts, 325 tests.
+**Current status:** OAuth migration implemented locally; deployment cutover and live consent/refresh verification remain. Stdio and both HTTP modes share `TokenManager`; Oura consent uses S256 PKCE. Run `pnpm build` and `pnpm test` for current validation.
+
+Authentication invariants:
+- One process per Oura credential pair; public HTTP mode is single-owner, with no per-user data isolation.
+- `TokenManager` owns refresh and persistence. HTTP callbacks pass the full credential response and await saving it before issuing an MCP authorization code.
+- Persist rotated pairs atomically at `OURA_CREDENTIALS_PATH`; mount the parent directory. Disk failures retain the new pair in memory and retry saving without replaying the consumed refresh token.
+- Refresh deduplicates concurrent calls; explicit 429/5xx responses get bounded background retries. Rejected or ambiguous refresh outcomes require reauthorization.
+- `OURA_PERSONAL_ACCESS_TOKEN` is rejected. `OURA_ACCESS_TOKEN` is a temporary non-refreshing override only without OAuth app configuration.
+- Default scopes follow Oura's documented scope list; do not add API endpoint names as OAuth scopes.
+- MCP-issued clients/tokens remain in memory; reconnect clients after restart. Full multi-user isolation and persistent MCP registrations remain future work.
 
 ## Key Files
 
@@ -296,7 +305,7 @@ pnpm generate-types   # Generate TypeScript types from spec
 pnpm update-types     # Update spec AND generate types (convenience)
 
 # Fixture Validation
-OURA_ACCESS_TOKEN=your_token npx ts-node scripts/validate-fixtures.ts  # Compare fixtures to real API
+OURA_ACCESS_TOKEN=short_lived_oauth_access_token npx ts-node scripts/validate-fixtures.ts  # Compare fixtures to real API
 ```
 
 ## Publishing Releases
@@ -400,7 +409,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
       "command": "node",
       "args": ["/absolute/path/to/oura-mcp/dist/index.js"],
       "env": {
-        "OURA_ACCESS_TOKEN": "your_token_here"
+        "OURA_CLIENT_ID": "your_client_id",
+        "OURA_CLIENT_SECRET": "your_client_secret"
       }
     }
   }
@@ -422,7 +432,8 @@ Deploy the MCP server for remote access (e.g., from mobile Claude when supported
 
 **1. Prerequisites:**
 - Railway account (https://railway.app)
-- Oura PAT token (https://cloud.ouraring.com/personal-access-tokens)
+- Oura OAuth app and saved credentials (see README.md)
+- Persistent volume mounted at /data
 - Generate a secret: `openssl rand -base64 32`
 
 **2. Deploy to Railway:**
@@ -438,7 +449,10 @@ railway up
 
 **3. Set Environment Variables** (in Railway dashboard):
 ```
-OURA_ACCESS_TOKEN=your_oura_pat_token
+OURA_CLIENT_ID=your_client_id
+OURA_CLIENT_SECRET=your_client_secret
+OURA_CREDENTIALS_PATH=/data/credentials.json
+MCP_AUTH_MODE=static
 MCP_SECRET=your_random_secret_here
 NODE_ENV=production
 ```
@@ -475,7 +489,7 @@ curl -X POST http://localhost:3000/mcp \
 ## Oura API Reference
 
 - Docs: https://cloud.ouraring.com/v2/docs
-- Get token: https://cloud.ouraring.com/personal-access-tokens
+- OAuth authentication: https://cloud.ouraring.com/docs/authentication
 - Rate limit: 5000 requests per 5 minutes
 - All durations are in **seconds** (we convert to hours/minutes for display)
 
@@ -494,12 +508,6 @@ curl -X POST http://localhost:3000/mcp \
 
 ## Auth Strategy
 
-**Option 1: Personal Access Token (simplest)**
-```bash
-export OURA_ACCESS_TOKEN=your_token_here
-# Get token at: https://cloud.ouraring.com/personal-access-tokens
-```
-
 **Option 2: OAuth CLI Flow (Phase 4a - implemented)**
 
 First, create an OAuth app at https://cloud.ouraring.com/oauth/applications, then:
@@ -511,13 +519,13 @@ npx oura-ring-mcp auth     # Opens browser → Oura OAuth → localhost callback
 npx oura-ring-mcp status   # Check authentication status
 npx oura-ring-mcp logout   # Clear stored credentials
 ```
-Credentials saved to `~/.oura-mcp/credentials.json`. Server auto-refreshes expired tokens.
+Credentials saved to `~/.oura-mcp/credentials.json`. Keep the OAuth app configuration set at runtime; the shared token manager refreshes before expiry and on 401.
 
 **Option 3b: Static bearer with server-managed Oura OAuth (`MCP_AUTH_MODE=static`)**
 
 For agents that authenticate with a static bearer (Hermes, Claude Desktop, etc.) but where you want Oura OAuth refresh instead of a PAT. Public MCP OAuth endpoints are NOT mounted.
 
-- Required env: `MCP_SECRET`, `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET`, `OURA_REFRESH_TOKEN` (seed, first run only), `OURA_CREDENTIALS_PATH` (recommended, Railway volume mount).
+- Required env: `MCP_SECRET`, `OURA_CLIENT_ID`, `OURA_CLIENT_SECRET`, `OURA_REFRESH_TOKEN` (optional seed only when no saved credentials exist), `OURA_CREDENTIALS_PATH` (recommended, Railway volume mount).
 - `TokenManager` (`src/auth/token-manager.ts`) loads persisted credentials, refreshes ~5 min before expiry, and writes the rotated refresh token back to disk.
 - `OuraClient.onUnauthorized` retries once on 401 by asking the token manager to refresh.
 
@@ -530,7 +538,8 @@ The HTTP transport proxies OAuth through Oura — users authenticate directly wi
 - `/authorize` redirects to Oura OAuth → user authorizes → Oura redirects to `/oauth/callback`
 - Server exchanges Oura code for tokens, then redirects back to Claude.ai
 - No PAT needed — the server gets Oura tokens via the OAuth flow
-- `MCP_SECRET` env var is also accepted as a static bearer token (requires `OURA_ACCESS_TOKEN`)
+- `MCP_SECRET` env var is also accepted as a static bearer token (Oura credentials come from the shared token manager)
+- This is a single-owner service; do not use public registration as multi-user account isolation.
 
 Required env vars for OAuth:
 - `OURA_CLIENT_ID` - From Oura OAuth app

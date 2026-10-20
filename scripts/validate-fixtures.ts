@@ -2,7 +2,7 @@
 /**
  * Validate test fixtures against the real Oura API
  *
- * Usage: OURA_ACCESS_TOKEN=your_token npx ts-node scripts/validate-fixtures.ts
+ * Usage: OURA_ACCESS_TOKEN=short_lived_oauth_access_token npx ts-node scripts/validate-fixtures.ts
  */
 
 import { readFileSync, writeFileSync } from "fs";
@@ -18,7 +18,7 @@ const FIXTURES_DIR = join(__dirname, "../tests/fixtures");
 const token = process.env.OURA_ACCESS_TOKEN;
 if (!token) {
   console.error("Error: OURA_ACCESS_TOKEN environment variable is required");
-  console.error("Usage: OURA_ACCESS_TOKEN=your_token npx ts-node scripts/validate-fixtures.ts");
+  console.error("Usage: OURA_ACCESS_TOKEN=short_lived_oauth_access_token npx ts-node scripts/validate-fixtures.ts");
   process.exit(1);
 }
 

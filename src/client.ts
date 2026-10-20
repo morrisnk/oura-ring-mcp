@@ -92,12 +92,16 @@ export class OuraClient {
   ): Promise<T> {
     const url = this.buildUrl(endpoint, params);
 
+    const requestedToken = this.accessToken;
     let response = await fetch(url, {
-      headers: { Authorization: `Bearer ${this.accessToken}` },
+      headers: { Authorization: `Bearer ${requestedToken}` },
     });
 
     if (response.status === 401 && this.onUnauthorized) {
-      const newToken = await this.onUnauthorized();
+      // Another request or the timer may already have refreshed this token.
+      const newToken = this.accessToken !== requestedToken
+        ? this.accessToken
+        : await this.onUnauthorized();
       this.accessToken = newToken;
       response = await fetch(url, {
         headers: { Authorization: `Bearer ${this.accessToken}` },

@@ -121,6 +121,9 @@ describe("OuraMcpOAuthProvider", () => {
       );
       expect(url.searchParams.get("state")).toBeDefined();
       expect(url.searchParams.get("scope")).toContain("daily");
+      expect(url.searchParams.get("scope")).not.toContain("ring_configuration");
+      expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+      expect(url.searchParams.get("code_challenge")).not.toBe("test-challenge");
       expect(redirectUrl.status).toBe(302);
     });
   });
@@ -169,6 +172,12 @@ describe("OuraMcpOAuthProvider", () => {
         ouraState
       );
 
+      const tokenBody = mockFetch.mock.calls[0][1].body as URLSearchParams;
+      const verifier = tokenBody.get("code_verifier")!;
+      const { createHash } = await import("node:crypto");
+      expect(createHash("sha256").update(verifier).digest("base64url")).toBe(
+        new URL(ouraRedirectUrl).searchParams.get("code_challenge")
+      );
       const url = new URL(redirectUrl);
       expect(url.origin).toBe("https://claude.ai");
       expect(url.pathname).toBe("/callback");
@@ -213,7 +222,10 @@ describe("OuraMcpOAuthProvider", () => {
 
       await providerWithCallback.handleOuraCallback("code", ouraState);
 
-      expect(onOuraTokens).toHaveBeenCalledWith("oura-token", "oura-refresh");
+      expect(onOuraTokens).toHaveBeenCalledWith({
+        access_token: "oura-token", refresh_token: "oura-refresh", token_type: "bearer",
+        expires_at: expect.any(Number),
+      });
     });
 
     it("should throw for invalid state", async () => {

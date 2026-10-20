@@ -24,8 +24,7 @@ import { OuraClient } from "./client.js";
 import { registerTools } from "./tools/index.js";
 import { registerResources } from "./resources/index.js";
 import { registerPrompts } from "./prompts/index.js";
-import { loadCredentials, isExpired } from "./auth/store.js";
-import { refreshAccessToken, getOAuthConfigFromEnv } from "./auth/oauth.js";
+import { getOAuthConfigFromEnv } from "./auth/oauth.js";
 import { TokenManager } from "./auth/token-manager.js";
 
 // Read version from package.json
@@ -62,84 +61,21 @@ if (["auth", "logout", "status"].includes(command)) {
   process.exit(0);
 }
 
-// ─────────────────────────────────────────────────────────────
-// Token Resolution
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Get access token from environment or stored credentials
- * Handles token refresh if expired
- *
- * Returns null if no token is found (HTTP mode can start without one)
- */
-async function getAccessToken(): Promise<string | null> {
-  // First priority: environment variable
-  const envToken = process.env.OURA_ACCESS_TOKEN || process.env.OURA_PERSONAL_ACCESS_TOKEN;
-  if (envToken) {
-    return envToken;
-  }
-
-  // Second priority: stored OAuth credentials
-  const credentials = await loadCredentials();
-  if (!credentials) {
-    return null;
-  }
-
-  // Check if token needs refresh
-  if (isExpired(credentials)) {
-    const oauthConfig = getOAuthConfigFromEnv();
-    if (!oauthConfig) {
-      console.error(
-        "Warning: Token expired and cannot refresh without OAuth credentials.\n" +
-          "Please set OURA_CLIENT_ID and OURA_CLIENT_SECRET, or run:\n" +
-          "  npx oura-ring-mcp auth"
-      );
-      return null;
-    }
-
-    console.error("Access token expired, refreshing...");
-    try {
-      const refreshed = await refreshAccessToken(credentials.refresh_token, oauthConfig);
-      console.error("Token refreshed successfully.");
-      return refreshed.access_token;
-    } catch (error) {
-      console.error(
-        `Token refresh failed: ${error instanceof Error ? error.message : error}\n` +
-          "Please re-authenticate: npx oura-ring-mcp auth"
-      );
-      return null;
-    }
-  }
-
-  return credentials.access_token;
+// OAuth is the default. An explicit access token is a temporary, non-refreshing
+// override only when OAuth app credentials have not been configured.
+const oauthConfig = getOAuthConfigFromEnv();
+const overrideToken = !useStaticBearerMode && !oauthConfig ? process.env.OURA_ACCESS_TOKEN : undefined;
+if (process.env.OURA_PERSONAL_ACCESS_TOKEN) {
+  throw new Error("OURA_PERSONAL_ACCESS_TOKEN is no longer supported. Configure OURA_CLIENT_ID/OURA_CLIENT_SECRET and run `oura-ring-mcp auth`.");
 }
-
-// ─────────────────────────────────────────────────────────────
-// Server Setup
-// ─────────────────────────────────────────────────────────────
-
-// Static bearer mode has its own token manager. Resolving stored credentials
-// here would try to refresh the same single-use token before that manager starts.
-const accessToken = useStaticBearerMode ? null : await getAccessToken();
-
-// For stdio transport, a token is required upfront
-if (!accessToken && !useHttpTransport) {
-  console.error(
-    "Error: No Oura credentials found.\n\n" +
-      "Option 1: Set OURA_ACCESS_TOKEN environment variable\n" +
-      "  Get your token at: https://cloud.ouraring.com/personal-access-tokens\n\n" +
-      "Option 2: Authenticate via OAuth\n" +
-      "  Run: npx oura-ring-mcp auth\n" +
-      "  (Requires OURA_CLIENT_ID and OURA_CLIENT_SECRET)"
-  );
-  process.exit(1);
+if (!oauthConfig && !overrideToken) {
+  throw new Error("Configure OURA_CLIENT_ID and OURA_CLIENT_SECRET, then run `oura-ring-mcp auth`.");
 }
-
-if (!accessToken && useHttpTransport && !useStaticBearerMode) {
-  console.error(
-    "Warning: No Oura credentials found. Server will start but API calls will fail.\n" +
-      "Set OURA_ACCESS_TOKEN environment variable to enable data access."
-  );
+if (useHttpTransport && !process.env.MCP_SECRET && (useStaticBearerMode || !oauthConfig)) {
+  throw new Error("HTTP bearer authentication requires MCP_SECRET.");
+}
+if (overrideToken) {
+  console.error("OURA_ACCESS_TOKEN is a temporary override without automatic refresh. Migrate to OAuth with `oura-ring-mcp auth`.");
 }
 
 const server = new McpServer({
@@ -147,39 +83,23 @@ const server = new McpServer({
   version: VERSION,
 });
 
-const ouraClient = new OuraClient({ accessToken: accessToken ?? "" });
-
-// In MCP_AUTH_MODE=static we manage the Oura OAuth token ourselves so
-// Hermes / Claude Desktop clients can authenticate via MCP_SECRET while
-// the server keeps a long-running OAuth session alive with Oura.
-if (useStaticBearerMode) {
-  const oauthConfig = getOAuthConfigFromEnv();
-  if (!oauthConfig) {
-    console.error(
-      "MCP_AUTH_MODE=static requires OURA_CLIENT_ID and OURA_CLIENT_SECRET."
-    );
-    process.exit(1);
-  }
-
-  const tokenManager = new TokenManager({
+const ouraClient = new OuraClient({ accessToken: overrideToken ?? "" });
+let tokenManager: TokenManager | undefined;
+if (oauthConfig) {
+  tokenManager = new TokenManager({
     oauthConfig,
     seedRefreshToken: process.env.OURA_REFRESH_TOKEN,
     onTokenUpdate: (token) => ouraClient.setAccessToken(token),
   });
-
   try {
-    await tokenManager.initialize();
-    console.error("Oura OAuth token manager initialized");
-  } catch (err) {
-    console.error(
-      `Failed to initialize Oura token manager: ${err instanceof Error ? err.message : err}\n` +
-        "Check OURA_CLIENT_ID/OURA_CLIENT_SECRET and the stored refresh token (OURA_CREDENTIALS_PATH, if set). " +
-        "If that token has already been used or revoked, re-authenticate and persist the new credentials."
-    );
-    process.exit(1);
+    await tokenManager.initialize(useHttpTransport && !useStaticBearerMode);
+  } catch (error) {
+    tokenManager.stop();
+    throw new Error(`Failed to initialize Oura OAuth: ${error instanceof Error ? error.message : "unknown error"}`);
   }
-
-  ouraClient.setOnUnauthorized(() => tokenManager.refresh());
+  ouraClient.setOnUnauthorized(() => tokenManager!.refresh());
+  // Timers are unref'ed; stop them when the transport closes as well.
+  server.server.onclose = () => tokenManager?.stop();
 }
 
 // Register all tools, resources, and prompts with the server
@@ -195,7 +115,7 @@ async function main() {
   if (useHttpTransport) {
     // HTTP transport for remote deployment
     const { startHttpServer } = await import("./transports/http.js");
-    await startHttpServer(server, { ouraClient });
+    await startHttpServer(server, { tokenManager });
   } else {
     // Stdio transport for local use (Claude Desktop)
     const transport = new StdioServerTransport();
@@ -204,7 +124,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+await main().catch((error) => {
   console.error("Failed to start server:", error);
   process.exit(1);
 });

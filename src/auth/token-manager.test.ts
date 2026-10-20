@@ -191,6 +191,9 @@ describe("TokenManager", () => {
       expect(d).toBeLessThanOrEqual(MAX_TIMEOUT_MS);
     }
 
+    await vi.advanceTimersByTimeAsync(MAX_TIMEOUT_MS);
+    expect(mockFetch).not.toHaveBeenCalled();
+
     mgr.stop();
     setTimeoutSpy.mockRestore();
   });
@@ -215,4 +218,141 @@ describe("TokenManager", () => {
     expect(onTokenUpdate).toHaveBeenLastCalledWith("a2");
     mgr.stop();
   });
+  it("can wait for HTTP consent without credentials", async () => {
+    vi.mocked(store.loadCredentials).mockResolvedValue(null);
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    expect(await mgr.initialize(true)).toBeNull();
+    await expect(mgr.refresh()).rejects.toThrow("not authenticated");
+    const credentials = { access_token: "callback-access", refresh_token: "callback-refresh", token_type: "bearer", expires_at: Date.now() + 3600000 };
+    await mgr.setCredentials(credentials);
+    expect(store.saveCredentials).toHaveBeenCalledWith(credentials);
+    expect(onTokenUpdate).toHaveBeenCalledWith("callback-access");
+    mgr.stop();
+  });
+
+  it("refreshes in the background before expiry and stops cleanly", async () => {
+    vi.useFakeTimers();
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "a", refresh_token: "r", token_type: "bearer", expires_at: Date.now() + 600000 });
+    mockFetch.mockResolvedValue(mockTokenResponse("fresh", "rotated"));
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await mgr.initialize();
+    await vi.advanceTimersByTimeAsync(300000);
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(onTokenUpdate).toHaveBeenLastCalledWith("fresh");
+    expect(store.saveCredentials).toHaveBeenCalledWith(expect.objectContaining({ refresh_token: "rotated" }));
+    mgr.stop();
+    await vi.advanceTimersByTimeAsync(3600000);
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it("persists a rotated pair again after a disk failure without replaying the consumed refresh token", async () => {
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "a", refresh_token: "r", token_type: "bearer", expires_at: Date.now() + 3600000 });
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await mgr.initialize();
+    mockFetch.mockResolvedValueOnce(mockTokenResponse("new", "rotated"));
+    vi.mocked(store.saveCredentials).mockRejectedValueOnce(new Error("disk full"));
+    await expect(mgr.refresh()).rejects.toThrow("retained in memory");
+    expect(mgr.getAccessToken()).toBe("new");
+    await expect(mgr.refresh()).resolves.toBe("new");
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(store.saveCredentials).toHaveBeenLastCalledWith(expect.objectContaining({ refresh_token: "rotated" }));
+    mgr.stop();
+  });
+
+  it("bounds background retries for explicit transient failures", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "a", refresh_token: "r", token_type: "bearer", expires_at: Date.now() + 3600000 });
+    mockFetch.mockResolvedValue({ ok: false, status: 503 });
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await mgr.initialize();
+    await expect(mgr.refresh()).rejects.toThrow("HTTP 503");
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(mockFetch).toHaveBeenCalledTimes(4);
+    mgr.stop();
+  });
+
+  it.each([400, 401, "network"])("does not replay rejected or ambiguous refreshes (%s)", async (failure) => {
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "a", refresh_token: "r", token_type: "bearer", expires_at: Date.now() + 3600000 });
+    if (failure === "network") mockFetch.mockRejectedValue(new TypeError("connection reset"));
+    else mockFetch.mockResolvedValue({ ok: false, status: failure });
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await mgr.initialize();
+    await expect(mgr.refresh()).rejects.toThrow("Re-authorize");
+    await expect(mgr.refresh()).rejects.toThrow("Re-authorize");
+    expect(mockFetch).toHaveBeenCalledOnce();
+    mgr.stop();
+  });
+
+  it("serializes new consent with an active refresh and keeps the new authorization", async () => {
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "a", refresh_token: "r", token_type: "bearer", expires_at: Date.now() + 3600000 });
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await mgr.initialize();
+    let resolveFetch!: (value: unknown) => void;
+    mockFetch.mockImplementationOnce(() => new Promise((resolve) => { resolveFetch = resolve; }));
+    const refresh = mgr.refresh();
+    const credentials = { access_token: "consent", refresh_token: "consent-refresh", token_type: "bearer", expires_at: Date.now() + 3600000 };
+    const consent = mgr.setCredentials(credentials);
+    resolveFetch(mockTokenResponse("refreshed", "rotated"));
+    await Promise.all([refresh, consent]);
+    expect(store.saveCredentials).toHaveBeenLastCalledWith(credentials);
+    expect(onTokenUpdate).toHaveBeenLastCalledWith("consent");
+    mgr.stop();
+  });
+
+  it("keeps startup alive after rotation if storage temporarily fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(store.loadCredentials).mockResolvedValue(null);
+    mockFetch.mockResolvedValueOnce(mockTokenResponse("fresh", "rotated"));
+    vi.mocked(store.saveCredentials).mockRejectedValueOnce(new Error("read-only volume"));
+    const mgr = new TokenManager({ oauthConfig: CONFIG, seedRefreshToken: "seed", onTokenUpdate });
+    await expect(mgr.initialize()).resolves.toBe("fresh");
+    expect(onTokenUpdate).toHaveBeenCalledWith("fresh");
+    await mgr.refresh();
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(store.saveCredentials).toHaveBeenLastCalledWith(expect.objectContaining({ refresh_token: "rotated" }));
+    mgr.stop();
+  });
+
+  it("keeps HTTP consent available when saved credentials have been revoked", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(store.loadCredentials).mockResolvedValue({ access_token: "old", refresh_token: "revoked", token_type: "bearer", expires_at: Date.now() - 1000 });
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 400 });
+    const mgr = new TokenManager({ oauthConfig: CONFIG, onTokenUpdate });
+    await expect(mgr.initialize(true)).resolves.toBeNull();
+    expect(onTokenUpdate).not.toHaveBeenCalled();
+    const credentials = { access_token: "reauthorized", refresh_token: "new-refresh", token_type: "bearer", expires_at: Date.now() + 3600000 };
+    await mgr.setCredentials(credentials);
+    expect(onTokenUpdate).toHaveBeenCalledWith("reauthorized");
+    mgr.stop();
+  });
+
+  it("does not reuse an environment seed when a saved credentials file is invalid", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(store.loadCredentials).mockRejectedValue(new Error("Invalid credentials file"));
+    const mgr = new TokenManager({ oauthConfig: CONFIG, seedRefreshToken: "stale-seed", onTokenUpdate });
+    await expect(mgr.initialize()).rejects.toThrow("Invalid credentials");
+    await expect(mgr.initialize(true)).resolves.toBeNull();
+    expect(mockFetch).not.toHaveBeenCalled();
+    mgr.stop();
+  });
+
+  it("continues saving the rotated pair until storage recovers, without another token exchange", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(store.loadCredentials).mockResolvedValue(null);
+    mockFetch.mockResolvedValueOnce(mockTokenResponse("fresh", "rotated"));
+    vi.mocked(store.saveCredentials).mockRejectedValue(new Error("volume unavailable"));
+    const mgr = new TokenManager({ oauthConfig: CONFIG, seedRefreshToken: "seed", onTokenUpdate });
+    await mgr.initialize();
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(store.saveCredentials).toHaveBeenCalledTimes(6);
+    vi.mocked(store.saveCredentials).mockResolvedValue(undefined);
+    await vi.advanceTimersByTimeAsync(32000);
+    expect(store.saveCredentials).toHaveBeenLastCalledWith(expect.objectContaining({ refresh_token: "rotated" }));
+    expect(onTokenUpdate).toHaveBeenLastCalledWith("fresh");
+    expect(mockFetch).toHaveBeenCalledOnce();
+    mgr.stop();
+  });
+
 });
