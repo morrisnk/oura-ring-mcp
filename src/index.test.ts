@@ -19,6 +19,7 @@ class MockMcpServer {
   static instances: MockMcpServer[] = [];
   static lastConfig: unknown;
 
+  server: { onclose?: () => void } = {};
   connect = vi.fn().mockResolvedValue(undefined);
   registerResource = vi.fn();
   registerPrompt = vi.fn();
@@ -70,6 +71,7 @@ class MockTokenManager {
     return "managed-token";
   });
   refresh = vi.fn();
+  stop = vi.fn();
 
   constructor(public options: { onTokenUpdate: (token: string) => void }) {
     MockTokenManager.instances.push(this);
@@ -159,7 +161,7 @@ describe("MCP Server", () => {
     mockRegisterPrompts.mockClear();
     mockLoadCredentials.mockClear();
     mockIsExpired.mockClear();
-    mockGetOAuthConfigFromEnv.mockClear();
+    mockGetOAuthConfigFromEnv.mockReset();
     mockRefreshAccessToken.mockClear();
     mockRunAuthFlow.mockClear();
     mockRunLogout.mockClear();
@@ -171,6 +173,10 @@ describe("MCP Server", () => {
     // Reset environment - always set a token for these tests
     process.env = { ...originalEnv };
     delete process.env.MCP_AUTH_MODE;
+    delete process.env.OURA_PERSONAL_ACCESS_TOKEN;
+    delete process.env.OURA_ACCESS_TOKEN;
+    delete process.env.OURA_CLIENT_ID;
+    delete process.env.OURA_CLIENT_SECRET;
     process.argv = [...originalArgv];
 
     // Suppress console.error from server startup
@@ -193,22 +199,13 @@ describe("MCP Server", () => {
       expect(MockOuraClient.lastConfig).toEqual({ accessToken: "test-token" });
     });
 
-    it("should accept OURA_PERSONAL_ACCESS_TOKEN as fallback", async () => {
-      delete process.env.OURA_ACCESS_TOKEN;
+    it("rejects the retired personal-access-token variable with migration guidance", async () => {
       process.env.OURA_PERSONAL_ACCESS_TOKEN = "personal-token";
-
-      await import("./index.js");
-
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "personal-token" });
+      await expect(import("./index.js")).rejects.toThrow("no longer supported");
     });
 
-    it("should prefer OURA_ACCESS_TOKEN over OURA_PERSONAL_ACCESS_TOKEN", async () => {
-      process.env.OURA_ACCESS_TOKEN = "primary-token";
-      process.env.OURA_PERSONAL_ACCESS_TOKEN = "fallback-token";
-
-      await import("./index.js");
-
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "primary-token" });
+    it("requires OAuth configuration when no explicit override is provided", async () => {
+      await expect(import("./index.js")).rejects.toThrow("OURA_CLIENT_ID");
     });
   });
 
@@ -268,52 +265,37 @@ describe("MCP Server", () => {
     });
   });
 
-  describe("stored credentials", () => {
-    it("should use stored credentials when no env token", async () => {
-      delete process.env.OURA_ACCESS_TOKEN;
-      delete process.env.OURA_PERSONAL_ACCESS_TOKEN;
-
-      mockLoadCredentials.mockResolvedValue({
-        access_token: "stored-token",
-        refresh_token: "refresh-token",
-        expires_at: Date.now() + 3600000,
-      });
-      mockIsExpired.mockReturnValue(false);
-
-      await import("./index.js");
-
-      expect(mockLoadCredentials).toHaveBeenCalled();
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "stored-token" });
-    });
-
-    it("should refresh expired token", async () => {
-      delete process.env.OURA_ACCESS_TOKEN;
-      delete process.env.OURA_PERSONAL_ACCESS_TOKEN;
-
-      mockLoadCredentials.mockResolvedValue({
-        access_token: "expired-token",
-        refresh_token: "refresh-token",
-        expires_at: Date.now() - 1000,
-      });
-      mockIsExpired.mockReturnValue(true);
+  describe("OAuth lifecycle", () => {
+    beforeEach(() => {
       mockGetOAuthConfigFromEnv.mockReturnValue({
-        clientId: "test-client",
-        clientSecret: "test-secret",
+        clientId: "test-client", clientSecret: "test-secret",
         redirectUri: "http://localhost:3000/callback",
       });
-      mockRefreshAccessToken.mockResolvedValue({
-        access_token: "refreshed-token",
-        refresh_token: "new-refresh-token",
-        expires_at: Date.now() + 3600000,
-      });
+    });
 
+    it("uses the manager for stdio and ignores a stale access-token override", async () => {
+      process.env.OURA_ACCESS_TOKEN = "stale-override";
       await import("./index.js");
+      const manager = MockTokenManager.instances[0];
+      expect(manager.initialize).toHaveBeenCalledWith(false);
+      expect(mockLoadCredentials).not.toHaveBeenCalled();
+      expect(mockRefreshAccessToken).not.toHaveBeenCalled();
+      expect(MockOuraClient.instances[0].setAccessToken).toHaveBeenCalledWith("managed-token");
+      const client = MockOuraClient.instances[0];
+      await client.setOnUnauthorized.mock.calls[0][0]();
+      expect(manager.refresh).toHaveBeenCalledOnce();
+      MockMcpServer.instances[0].server.onclose?.();
+      expect(manager.stop).toHaveBeenCalledOnce();
+    });
 
-      expect(mockRefreshAccessToken).toHaveBeenCalledWith(
-        "refresh-token",
-        expect.objectContaining({ clientId: "test-client" })
-      );
-      expect(MockOuraClient.lastConfig).toEqual({ accessToken: "refreshed-token" });
+    it("allows HTTP OAuth to start before the first consent", async () => {
+      process.argv = [originalArgv[0], originalArgv[1], "--http"];
+      await import("./index.js");
+      expect(MockTokenManager.instances[0].initialize).toHaveBeenCalledWith(true);
+      const { startHttpServer } = await import("./transports/http.js");
+      expect(startHttpServer).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        tokenManager: MockTokenManager.instances[0],
+      }));
     });
   });
 
@@ -321,6 +303,7 @@ describe("MCP Server", () => {
     it("lets the token manager resolve credentials without a second startup refresh", async () => {
       process.argv = [originalArgv[0], originalArgv[1], "--http"];
       process.env.MCP_AUTH_MODE = "static";
+      process.env.MCP_SECRET = "test-secret";
       delete process.env.OURA_ACCESS_TOKEN;
       delete process.env.OURA_PERSONAL_ACCESS_TOKEN;
       mockGetOAuthConfigFromEnv.mockReturnValue({

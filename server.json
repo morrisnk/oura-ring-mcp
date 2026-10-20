@@ -17,25 +17,25 @@
       },
       "environmentVariables": [
         {
-          "description": "Oura Personal Access Token (get from cloud.ouraring.com/personal-access-tokens)",
-          "isRequired": false,
-          "format": "string",
-          "isSecret": true,
-          "name": "OURA_ACCESS_TOKEN"
-        },
-        {
-          "description": "OAuth Client ID (alternative to access token, from developer.ouraring.com)",
-          "isRequired": false,
+          "description": "Oura OAuth client ID; run oura-ring-mcp auth before starting",
+          "isRequired": true,
           "format": "string",
           "isSecret": false,
           "name": "OURA_CLIENT_ID"
         },
         {
-          "description": "OAuth Client Secret (required with OURA_CLIENT_ID)",
-          "isRequired": false,
+          "description": "Oura OAuth client secret used for automatic token refresh",
+          "isRequired": true,
           "format": "string",
           "isSecret": true,
           "name": "OURA_CLIENT_SECRET"
+        },
+        {
+          "name": "OURA_CREDENTIALS_PATH",
+          "description": "Optional saved OAuth credentials file; defaults to ~/.oura-mcp/credentials.json",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
         }
       ]
     }

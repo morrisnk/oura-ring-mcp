@@ -23,11 +23,11 @@ function getErrorMessage(status: number, body: string): string {
 
     case 401:
       return "Authentication failed: Your Oura access token is invalid or expired. " +
-        "Get a new token at https://cloud.ouraring.com/personal-access-tokens";
+        "Re-authorize with `oura-ring-mcp auth` or reconnect the HTTP OAuth connector.";
 
     case 403:
       return "Access denied: Your token doesn't have permission for this data. " +
-        "Make sure you granted the required scopes when creating your token.";
+        "Check OURA_SCOPES and re-authorize, granting the required permissions in Oura.";
 
     case 404:
       return "Endpoint not found: This Oura API endpoint may have changed. " +

@@ -27,7 +27,8 @@ import {
   OuraMcpOAuthProvider,
   type OuraMcpOAuthProviderOptions,
 } from "../auth/mcp-oauth-provider.js";
-import type { OuraClient } from "../client.js";
+import { getOAuthConfigFromEnv } from "../auth/oauth.js";
+import type { TokenManager } from "../auth/token-manager.js";
 
 // ─────────────────────────────────────────────────────────────
 // Types
@@ -38,10 +39,10 @@ export interface HttpTransportOptions {
   port?: number;
   /** Secret for bearer token auth (backward compat with MCP_SECRET) */
   secret?: string;
-  /** Enable stateless mode for horizontal scaling (default: true) */
+  /** Disable MCP transport sessions (default: true); OAuth still requires one instance */
   stateless?: boolean;
-  /** OuraClient instance to update when OAuth tokens are obtained */
-  ouraClient?: OuraClient;
+  /** Shared owner of persisted Oura credentials. */
+  tokenManager?: TokenManager;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -69,7 +70,6 @@ export async function startHttpServer(
   const port = options.port ?? parseInt(process.env.PORT || "3000", 10);
   const secret = options.secret ?? process.env.MCP_SECRET;
   const stateless = options.stateless ?? true;
-  const ouraClient = options.ouraClient;
 
   const baseUrl = resolveBaseUrl(port);
 
@@ -85,15 +85,10 @@ export async function startHttpServer(
   const useStaticBearerMode = authMode === "static";
 
   if (useStaticBearerMode && !secret) {
-    console.error(
-      "ERROR: MCP_AUTH_MODE=static requires MCP_SECRET to be set."
-    );
+    throw new Error("MCP_AUTH_MODE=static requires MCP_SECRET to be set.");
   }
   if (!useStaticBearerMode && !hasOuraOAuth && !secret) {
-    console.error(
-      "WARNING: No authentication configured!\n" +
-        "Set OURA_CLIENT_ID + OURA_CLIENT_SECRET for OAuth, or MCP_SECRET for static auth."
-    );
+    throw new Error("HTTP transport requires OAuth configuration or MCP_SECRET.");
   }
 
   const app = express();
@@ -179,11 +174,10 @@ export async function startHttpServer(
       ouraClientId: ouraClientId!,
       ouraClientSecret: ouraClientSecret!,
       staticSecret: secret,
-      onOuraTokens: (accessToken, _refreshToken) => {
-        if (ouraClient) {
-          ouraClient.setAccessToken(accessToken);
-          console.error("OuraClient updated with new OAuth token");
-        }
+      ouraScopes: getOAuthConfigFromEnv()?.scopes,
+      onOuraTokens: async (credentials) => {
+        if (!options.tokenManager) throw new Error("Oura token manager is not configured.");
+        await options.tokenManager.setCredentials(credentials);
       },
     };
 
@@ -206,19 +200,13 @@ export async function startHttpServer(
     // Oura OAuth callback — handles redirect from Oura after user authorizes
     app.get("/oauth/callback", async (req: Request, res: Response) => {
       try {
-        const code = req.query.code as string;
-        const state = req.query.state as string;
-        const error = req.query.error as string;
+        const code = typeof req.query.code === "string" ? req.query.code : undefined;
+        const state = typeof req.query.state === "string" ? req.query.state : undefined;
+        const error = typeof req.query.error === "string" ? req.query.error : undefined;
 
         if (error) {
-          const description = req.query.error_description as string;
-          res.status(400).send(
-            `<html><body>
-              <h2>Authorization failed</h2>
-              <p>${description || error}</p>
-              <p>You can close this window.</p>
-            </body></html>`
-          );
+          oauthProvider.handleOuraDenied(state ?? "");
+          res.status(400).type("text").send("Oura authorization denied. Please reconnect and try again.");
           return;
         }
 
@@ -231,14 +219,8 @@ export async function startHttpServer(
         const redirectUrl = await oauthProvider.handleOuraCallback(code, state);
         res.redirect(302, redirectUrl);
       } catch (err) {
-        console.error("OAuth callback error:", err);
-        res.status(500).send(
-          `<html><body>
-            <h2>Authorization error</h2>
-            <p>${err instanceof Error ? err.message : String(err)}</p>
-            <p>Please try again.</p>
-          </body></html>`
-        );
+        console.error("OAuth callback failed:", err instanceof Error ? err.message : "unknown error");
+        res.status(400).type("text").send("Oura authorization could not be completed. Please try again or check the server logs.");
       }
     });
 

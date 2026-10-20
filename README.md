@@ -35,56 +35,24 @@ npx oura-ring-mcp
 
 ### 2. Authenticate with Oura
 
-**Option A: Personal Access Token (simpler)**
+Oura personal access tokens are deprecated. Use the authorization-code OAuth flow with PKCE:
 
-1. Go to [cloud.ouraring.com/personal-access-tokens](https://cloud.ouraring.com/personal-access-tokens)
-2. Create a new token
-3. Set `OURA_ACCESS_TOKEN` in your Claude Desktop config (see below)
+1. Create an app at [Oura OAuth Applications](https://cloud.ouraring.com/oauth/applications).
+2. Register the exact redirect URI `http://localhost:3000/callback`.
+3. Stop any server using the same credentials, then authorize:
 
-**Option B: OAuth CLI Flow**
-
-1. Create an OAuth app at [developer.ouraring.com](https://developer.ouraring.com/applications)
-   - Set Redirect URI to `http://localhost:3000/callback`
-2. Run the auth flow:
    ```bash
    export OURA_CLIENT_ID=your_client_id
    export OURA_CLIENT_SECRET=your_client_secret
+   export OURA_REDIRECT_URI=http://localhost:3000/callback
    npx oura-ring-mcp auth
    ```
-3. Credentials are saved to `~/.oura-mcp/credentials.json`
+
+Credentials are saved to `~/.oura-mcp/credentials.json`, or `OURA_CREDENTIALS_PATH` if set. The CLI callback must be an HTTP loopback address; custom ports and paths are supported. Keep the client ID and secret configured in the running server so it can refresh tokens.
 
 ### 3. Configure Claude Desktop
 
-Add to `claude_desktop_config.json`:
-
-**With Personal Access Token:**
-```json
-{
-  "mcpServers": {
-    "oura": {
-      "command": "npx",
-      "args": ["oura-ring-mcp"],
-      "env": {
-        "OURA_ACCESS_TOKEN": "your_token_here"
-      }
-    }
-  }
-}
-```
-
-**With OAuth (after running `npx oura-ring-mcp auth`):**
-```json
-{
-  "mcpServers": {
-    "oura": {
-      "command": "npx",
-      "args": ["oura-ring-mcp"]
-    }
-  }
-}
-```
-
-The server reads credentials from `~/.oura-mcp/credentials.json`. To enable automatic token refresh, add your OAuth credentials:
+After authorization, add to `claude_desktop_config.json`:
 
 ```json
 {
@@ -100,6 +68,22 @@ The server reads credentials from `~/.oura-mcp/credentials.json`. To enable auto
   }
 }
 ```
+
+The server refreshes tokens before expiry and retries API requests once after a 401. Defaults request `personal daily heartrate workout tag session spo2`; set `OURA_SCOPES` to a space-separated subset if you only use some tools. Oura may grant fewer permissions than requested; a 403 requires checking permissions and authorizing again. The deprecated callback `scope` parameter is not required.
+
+`oura-ring-mcp status` inspects the saved expiry and local configuration; it does not verify access with Oura. `oura-ring-mcp logout` clears the local file. Stop servers first, and revoke the application in your Oura account if you want to withdraw access completely.
+
+### Migrating an existing installation
+
+1. Register the OAuth app and configure the client ID/secret as above.
+2. Stop all processes using the same Oura credential pair, including before CLI reauthorization.
+3. Run this checkout's `pnpm build` and `node dist/index.js auth`. For a container, set `OURA_CREDENTIALS_PATH` to the host path of the credentials file in its mounted volume.
+4. Remove `OURA_PERSONAL_ACCESS_TOKEN` and `OURA_ACCESS_TOKEN` from the server environment, then restart with OAuth configuration.
+5. Confirm a data request succeeds, the credentials file is writable, and the service can restart using that file.
+
+`OURA_PERSONAL_ACCESS_TOKEN` is no longer supported. `OURA_ACCESS_TOKEN` remains a temporary, non-refreshing override only when neither OAuth client setting is configured. It must contain a currently valid bearer token; OAuth configuration takes precedence. New deployments should use OAuth.
+
+Only one process may own a credential pair. Refresh tokens rotate and are single-use. Persist the credentials **directory** on a durable volume so atomic file replacement works; do not bind-mount only the JSON file. Explicit transient refresh failures receive up to three background retries. Rejected credentials or an unknown exchange outcome require reauthorization; token requests are not blindly replayed after network failure. Failed disk writes retain the rotated pair in memory and retry saving it; fix storage before restarting the process.
 
 Restart Claude Desktop. Requires Node >=18.
 
@@ -181,7 +165,9 @@ Restart Claude Desktop. Requires Node >=18.
 
 ## Remote Deployment (Railway)
 
-Deploy the MCP server for remote access. The server proxies OAuth through Oura, so users authenticate directly with their Oura account — no PAT needed.
+Deploy the MCP server for remote access. The server proxies OAuth through Oura, so you authorize access directly with your Oura account.
+
+This is a **single-owner service**. All accepted MCP clients share one Oura account. Restrict access to trusted clients; this implementation does not isolate multiple users. MCP OAuth registrations and MCP-issued tokens are in memory, so reconnect clients after a server restart. If saved Oura credentials are rejected, this mode keeps the consent endpoints available so you can authorize again. Oura credentials are persisted separately. Run one instance per credential pair.
 
 ### 1. Create an Oura OAuth App
 
@@ -212,16 +198,16 @@ In the Railway dashboard, add:
 | `OURA_CLIENT_SECRET` | From your Oura OAuth app |
 | `NODE_ENV` | `production` |
 | `MCP_SECRET` | *(Optional)* Static bearer token for Claude Desktop (`openssl rand -base64 32`) |
-| `OURA_ACCESS_TOKEN` | *(Optional)* PAT fallback if not using OAuth (`MCP_SECRET` required) |
 | `MCP_AUTH_MODE` | *(Optional)* Set to `static` for bearer-only auth with server-managed Oura OAuth (see below) |
-| `OURA_REFRESH_TOKEN` | *(Required on first run in `static` mode)* Seed refresh token from `npx oura-ring-mcp auth` |
-| `OURA_CREDENTIALS_PATH` | *(Recommended in `static` mode)* File path for persisted Oura credentials — mount a persistent volume at this path |
+| `OURA_REFRESH_TOKEN` | *(Optional)* Initial seed only when no saved credentials exist; prefer saving the full pair with the CLI |
+| `OURA_CREDENTIALS_PATH` | File path for persisted Oura credentials; mount its parent directory on a durable volume in either HTTP mode |
+| `OURA_SCOPES` | Optional space-separated Oura permissions; defaults listed above |
 
 Railway automatically sets `PORT` and `RAILWAY_PUBLIC_DOMAIN`.
 
 #### Static bearer + server-managed Oura OAuth (`MCP_AUTH_MODE=static`)
 
-Use this for agents (e.g. Hermes) that authenticate with a static bearer token but where you still want Oura OAuth token refresh instead of a long-lived PAT. Works on any Docker host (Railway, unraid, self-hosted, etc.).
+Use this for agents (e.g. Hermes) that authenticate with a static bearer token but where the server manages Oura OAuth token refresh. Works on any Docker host (Railway, unraid, self-hosted, etc.).
 
 - MCP clients authenticate with `Authorization: Bearer $MCP_SECRET`. The public MCP OAuth 2.1 endpoints (`/authorize`, `/token`, `/register`) are **not** mounted.
 - The server holds a long-running Oura OAuth session, refreshing in the background and persisting the rotated refresh token to `OURA_CREDENTIALS_PATH`.
@@ -244,7 +230,7 @@ Use the **connector** in Claude.ai:
 
 ### 5. Connect from Claude Desktop
 
-For Claude Desktop, use `MCP_SECRET` + `OURA_ACCESS_TOKEN`:
+For Claude Desktop, configure static mode with server-managed Oura OAuth as above, then use `MCP_SECRET` in the client:
 
 ```json
 {
@@ -265,8 +251,8 @@ For Claude Desktop, use `MCP_SECRET` + `OURA_ACCESS_TOKEN`:
 # With Oura OAuth (full flow)
 OURA_CLIENT_ID=your_id OURA_CLIENT_SECRET=your_secret pnpm start:http
 
-# With static secret only (requires OURA_ACCESS_TOKEN)
-OURA_ACCESS_TOKEN=your_pat MCP_SECRET=test-secret pnpm start:http
+# With server-managed Oura OAuth (authorize first, keep OAuth app env configured)
+MCP_AUTH_MODE=static MCP_SECRET=test-secret pnpm start:http
 
 # Verify health endpoint
 curl http://localhost:3000/health

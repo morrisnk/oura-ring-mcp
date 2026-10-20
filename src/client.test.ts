@@ -105,6 +105,20 @@ describe("OuraClient", () => {
       });
     });
 
+    it("uses an already-refreshed token for a late 401 without another refresh", async () => {
+      const onUnauthorized = vi.fn();
+      const client = new OuraClient({ accessToken: "old", onUnauthorized });
+      let rejectOld!: (value: unknown) => void;
+      mockFetch.mockImplementationOnce(() => new Promise((resolve) => { rejectOld = resolve; }));
+      const request = client.getSleep("2024-01-15", "2024-01-15");
+      client.setAccessToken("new");
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => sleepResponse });
+      rejectOld({ status: 401, ok: false });
+      await request;
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe("Bearer new");
+    });
+
     it("does not retry more than once", async () => {
       const onUnauthorized = vi.fn().mockResolvedValue("still-bad");
       const hookedClient = new OuraClient({
